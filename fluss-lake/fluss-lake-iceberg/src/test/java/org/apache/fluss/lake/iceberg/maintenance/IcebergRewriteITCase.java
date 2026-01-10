@@ -165,40 +165,44 @@ class IcebergRewriteITCase extends FlinkIcebergTieringTestBase {
 
     @Test
     void testLogTableCompaction() throws Exception {
-        JobClient jobClient = buildTieringJob(execEnv);
-        try {
-            TablePath t1 = TablePath.of(DEFAULT_DB, "log_table");
-            long t1Id = createLogTable(t1, 1, true, logSchema);
-            TableBucket t1Bucket = new TableBucket(t1Id, 0);
+        for (var iteration = 0; iteration < 50; iteration++) {
+            JobClient jobClient = buildTieringJob(execEnv);
+            try {
+                TablePath t1 = TablePath.of(DEFAULT_DB, "log_table_" + iteration);
+                long t1Id = createLogTable(t1, 1, true, logSchema);
+                TableBucket t1Bucket = new TableBucket(t1Id, 0);
 
-            int i = 0;
-            List<InternalRow> flussRows = new ArrayList<>();
-            flussRows.addAll(
-                    writeIcebergTableRecords(
-                            t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
+                int i = 0;
+                List<InternalRow> flussRows = new ArrayList<>();
+                flussRows.addAll(
+                        writeIcebergTableRecords(
+                                t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
 
-            flussRows.addAll(
-                    writeIcebergTableRecords(
-                            t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
+                flussRows.addAll(
+                        writeIcebergTableRecords(
+                                t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
 
-            flussRows.addAll(
-                    writeIcebergTableRecords(
-                            t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
-            checkFileStatusInIcebergTable(t1, 3, false);
+                flussRows.addAll(
+                        writeIcebergTableRecords(
+                                t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
+                checkFileStatusInIcebergTable(t1, 3, false);
 
-            // Write should trigger compaction now since the current data file count is greater or
-            // equal MIN_FILES_TO_COMPACT
-            flussRows.addAll(
-                    writeIcebergTableRecords(
-                            t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
-            // Should only have two files now, one file it for newly written, one file is for target
-            // compacted file
-            checkFileStatusInIcebergTable(t1, 2, false);
+                // Write should trigger compaction now since the current data file count is greater
+                // or
+                // equal MIN_FILES_TO_COMPACT
+                flussRows.addAll(
+                        writeIcebergTableRecords(
+                                t1, t1Bucket, ++i, true, Collections.singletonList(row(1, "v1"))));
+                // Should only have two files now, one file it for newly written, one file is for
+                // target
+                // compacted file
+                checkFileStatusInIcebergTable(t1, 2, false);
 
-            // check data in iceberg to make sure compaction won't lose data or duplicate data
-            checkRecords(getIcebergRecords(t1), flussRows);
-        } finally {
-            jobClient.cancel().get();
+                // check data in iceberg to make sure compaction won't lose data or duplicate data
+                checkRecords(getIcebergRecords(t1), flussRows);
+            } finally {
+                jobClient.cancel().get();
+            }
         }
     }
 

@@ -215,6 +215,14 @@ public class LakeTableTieringManager implements AutoCloseable {
         inLock(
                 lock,
                 () -> {
+                    boolean inQueue = pendingTieringTables.contains(tableId);
+                    LOG.debug(
+                            "REMOVE_TABLE: tableId={} path={} state={} epoch={} pendingQueueContains={}",
+                            tableId,
+                            tablePaths.get(tableId),
+                            tieringStates.get(tableId),
+                            tableTierEpoch.get(tableId),
+                            inQueue);
                     tablePaths.remove(tableId);
                     tableLakeFreshness.remove(tableId);
                     tableLastTieredTime.remove(tableId);
@@ -256,33 +264,35 @@ public class LakeTableTieringManager implements AutoCloseable {
         return inLock(
                 lock,
                 () -> {
-                    while (true) {
-                        Long tableId = pendingTieringTables.poll();
-                        // no any pending table, return directly
-                        if (tableId == null) {
-                            return null;
-                        }
-
-                        TablePath tablePath = tablePaths.get(tableId);
-                        // the table has been dropped, request again
-                        if (tablePath == null) {
-                            continue;
-                        }
-
-                        TieringState state = tieringStates.get(tableId);
-                        if (state != TieringState.Pending) {
-                            // stale queue entry, ignore
-                            LOG.debug(
-                                    "requestTable: skipping table {} because state is {}",
-                                    tableId,
-                                    state);
-                            continue;
-                        }
-
-                        doHandleStateChange(tableId, TieringState.Tiering);
-                        long tieringEpoch = tableTierEpoch.get(tableId);
-                        return new LakeTieringTableInfo(tableId, tablePath, tieringEpoch);
+                    Long tableId = pendingTieringTables.poll();
+                    if (tableId == null) {
+                        return null;
                     }
+
+                    TablePath tablePath = tablePaths.get(tableId);
+                    if (tablePath == null) {
+                        LOG.debug(
+                                "REQUEST_STALE_QUEUE_DROPPED_TABLE: polled tableId={} but tablePath is null (state={}, epoch={})",
+                                tableId,
+                                tieringStates.get(tableId),
+                                tableTierEpoch.get(tableId));
+                        return requestTable();
+                    }
+
+                    TieringState state = tieringStates.get(tableId);
+                    if (state != TieringState.Pending) {
+                        LOG.debug(
+                                "TIERING_QUEUE_INCONSISTENCY: polled table {} ({}) from pending queue, but state is {} (epoch={}, liveTiering={})",
+                                tableId,
+                                tablePath,
+                                state,
+                                tableTierEpoch.get(tableId),
+                                liveTieringTableIds.containsKey(tableId));
+                    }
+
+                    doHandleStateChange(tableId, TieringState.Tiering);
+                    long tieringEpoch = tableTierEpoch.get(tableId);
+                    return new LakeTieringTableInfo(tableId, tablePath, tieringEpoch);
                 });
     }
 
@@ -381,15 +391,17 @@ public class LakeTableTieringManager implements AutoCloseable {
     private void doHandleStateChange(long tableId, TieringState targetState) {
         TieringState currentState = tieringStates.get(tableId);
         if (!isValidStateTransition(currentState, targetState)) {
-            LOG.error(
-                    "Fail to change state for table {} from {} to {} as it's not a valid state change.",
+            LOG.warn(
+                    "INVALID_TRANSITION: table {} ({}) {} -> {} rejected. queueContains={}, liveTiering={}, epoch={}",
                     tableId,
+                    tablePaths.get(tableId),
                     currentState,
-                    targetState);
+                    targetState,
+                    pendingTieringTables.contains(tableId),
+                    liveTieringTableIds.containsKey(tableId),
+                    tableTierEpoch.get(tableId));
             return;
         }
-
-        doStateChange(tableId, currentState, targetState);
         switch (targetState) {
             case New:
             case Initialized:
@@ -401,7 +413,24 @@ public class LakeTableTieringManager implements AutoCloseable {
             case Pending:
                 // increase tiering epoch and initialize the heartbeat of the tiering table
                 tableTierEpoch.computeIfPresent(tableId, (t, v) -> v + 1);
+                if (pendingTieringTables.contains(tableId)) {
+                    LOG.debug(
+                            "PENDING_ENQUEUE_DUPLICATE: table {} ({}) already present in pending queue. state={}, epoch={}",
+                            tableId,
+                            tablePaths.get(tableId),
+                            tieringStates.get(tableId),
+                            tableTierEpoch.get(tableId));
+                }
+
                 pendingTieringTables.add(tableId);
+
+                LOG.debug(
+                        "PENDING_ENQUEUE: table {} ({}) enqueued. queueSize={}, state={}, epoch={}",
+                        tableId,
+                        tablePaths.get(tableId),
+                        pendingTieringTables.size(),
+                        tieringStates.get(tableId),
+                        tableTierEpoch.get(tableId));
                 break;
             case Tiering:
                 liveTieringTableIds.put(tableId, clock.milliseconds());
@@ -415,6 +444,7 @@ public class LakeTableTieringManager implements AutoCloseable {
                 // do nothing
                 break;
         }
+        doStateChange(tableId, currentState, targetState);
     }
 
     private boolean isValidStateTransition(
@@ -473,9 +503,21 @@ public class LakeTableTieringManager implements AutoCloseable {
         public void run() {
             inLock(
                     lock,
-                    () ->
-                            // to pending state
-                            doHandleStateChange(tableId, TieringState.Pending));
+                    () -> {
+                        TieringState currentState = tieringStates.get(tableId);
+
+                        if (currentState != TieringState.Scheduled) {
+                            LOG.debug(
+                                    "DELAYED_TIERING_FIRED_UNEXPECTED: table {} ({}) timer fired but state is {} (epoch={}, queueContains={})",
+                                    tableId,
+                                    tablePaths.get(tableId),
+                                    currentState,
+                                    tableTierEpoch.get(tableId),
+                                    pendingTieringTables.contains(tableId));
+                        }
+
+                        doHandleStateChange(tableId, TieringState.Pending);
+                    });
         }
     }
 
